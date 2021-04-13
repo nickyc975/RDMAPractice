@@ -1,0 +1,16 @@
+# Generated files
+*.o
+*.ko
+*.o.cmd
+*.ko.cmd
+*.o.d
+*.mod.c
+Module.symvers
+modules.order
+
+# Generated folders
+.tmp_versions/
+
+# VSCode settings
+
+.vscode/
