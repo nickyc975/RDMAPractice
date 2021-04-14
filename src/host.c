@@ -10,7 +10,14 @@ MODULE_AUTHOR("Chen Jinlong");
 MODULE_DESCRIPTION("RDMA practice project host module.");
 MODULE_LICENSE("GPL v2");
 
-static struct proc_dir_entry *proc_entry;
+enum cjl_rdma_state
+{
+    INITIATED,
+    ADDR_RESOLVED,
+    ROUTE_RESOLVED,
+    CONNECTED,
+    ERROR,
+};
 
 struct cjl_rdma_ctrl
 {
@@ -24,12 +31,17 @@ struct cjl_rdma_ctrl
     struct ib_pd *pd;
 
     struct rdma_cm_id *cm_id;
+
+    wait_queue_head_t sem;
+    enum cjl_rdma_state state;
 };
 
 static struct cjl_rdma_ctrl *host_ctrl;
+static struct proc_dir_entry *proc_entry;
 
-static int parse_addr(const char *addr, size_t len)
+static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
 {
+    char *end = NULL;
     int res = 0;
     size_t delim_pos = 0;
     while (delim_pos < len && addr[delim_pos] != ':')
@@ -39,6 +51,7 @@ static int parse_addr(const char *addr, size_t len)
 
     if (delim_pos >= len - 1)
     {
+        printk(KERN_ERR "invalid address: \"%s\"\n", addr);
         res = -EINVAL;
         goto out;
     }
@@ -46,14 +59,20 @@ static int parse_addr(const char *addr, size_t len)
     res = kstrtou16(addr + delim_pos + 1, 10, &host_ctrl->target_port);
     if (res)
     {
+        printk(KERN_ERR "invalid port: \"%s\"\n", addr + delim_pos + 1);
         goto out;
     }
 
-    res = in4_pton(addr, delim_pos, host_ctrl->target_addr, -1, NULL);
-    if (res)
+    if (!in4_pton(addr, delim_pos, host_ctrl->target_addr, -1, &end))
     {
+        printk(KERN_ERR "invalid address: \"%s\", last char: %c\n", addr, *end);
+        res = -EINVAL;
         goto out;
     }
+
+    sin->sin_family = AF_INET;
+    memcpy((void *)&sin->sin_addr.s_addr, &host_ctrl->target_addr, 4);
+    sin->sin_port = host_ctrl->target_port;
 
     host_ctrl->target_str = kmalloc(len + 1, GFP_KERNEL);
     if (host_ctrl->target_str == NULL)
@@ -61,7 +80,6 @@ static int parse_addr(const char *addr, size_t len)
         res = -ENOMEM;
         goto out;
     }
-
     memcpy(host_ctrl->target_str, addr, len);
     host_ctrl->target_str[len] = '\0';
 
@@ -74,29 +92,37 @@ static int cjl_rdma_connect(const char *addr, size_t len)
     int res = 0;
     struct sockaddr_in sin;
 
-    res = parse_addr(addr, len);
+    res = parse_addr(addr, len, &sin);
     if (res)
-    {
         goto out;
-    }
 
-    sin.sin_family = AF_INET;
-    memcpy((void *)&sin.sin_addr.s_addr, &host_ctrl->target_addr, 4);
-    sin.sin_port = host_ctrl->target_port;
+    res = rdma_resolve_addr(host_ctrl->cm_id, NULL, (struct sockaddr *)&sin, 5000);
+    if (res)
+        goto resolve_addr_error;
+    wait_event_interruptible(host_ctrl->sem, host_ctrl->state >= ADDR_RESOLVED);
+    if (host_ctrl->state == ERROR)
+        goto resolve_addr_error;
+    printk(KERN_INFO "addr resolved\n");
 
-    // res = rdma_resolve_addr(host_ctrl->cm_id, NULL, (struct sockaddr *)&sin, 5000);
+    res = rdma_resolve_route(host_ctrl->cm_id, 5000);
+    if (res)
+        goto resolve_route_error;
+    wait_event_interruptible(host_ctrl->sem, host_ctrl->state >= ROUTE_RESOLVED);
+    if (host_ctrl->state == ERROR)
+        goto resolve_route_error;
+    printk(KERN_INFO "route resolved\n");
 
 out:
     return res;
+
+resolve_addr_error:
+    printk(KERN_ERR "Failed to resolve target addr \"%s\"\n", host_ctrl->target_str);
+    return res ? res : -1;
+
+resolve_route_error:
+    printk(KERN_ERR "Failed to resolve route to target addr \"%s\"\n", host_ctrl->target_str);
+    return res ? res : -1;
 }
-
-// static int cjl_rdma_read()
-// {
-// }
-
-// static int cjl_rdma_write()
-// {
-// }
 
 static void cjl_rdma_disconnect(void)
 {
@@ -253,18 +279,25 @@ static int cjl_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event
     switch (event->event)
     {
     case RDMA_CM_EVENT_ADDR_RESOLVED:
+        ctrl->state = ADDR_RESOLVED;
+        wake_up_interruptible(&ctrl->sem);
         break;
     case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        break;
-    case RDMA_CM_EVENT_CONNECT_RESPONSE:
+        ctrl->state = ROUTE_RESOLVED;
+        wake_up_interruptible(&ctrl->sem);
         break;
     case RDMA_CM_EVENT_ESTABLISHED:
+        ctrl->state = CONNECTED;
+        wake_up_interruptible(&ctrl->sem);
         break;
     case RDMA_CM_EVENT_ADDR_ERROR:
     case RDMA_CM_EVENT_ROUTE_ERROR:
     case RDMA_CM_EVENT_CONNECT_ERROR:
     case RDMA_CM_EVENT_UNREACHABLE:
     case RDMA_CM_EVENT_REJECTED:
+        printk(KERN_ERR "RDMA error: %d\n", event->event);
+        ctrl->state = ERROR;
+        wake_up_interruptible(&ctrl->sem);
         break;
     case RDMA_CM_EVENT_DISCONNECTED:
         break;
@@ -293,6 +326,8 @@ static int __init host_init(void)
         res = PTR_ERR_OR_ZERO(host_ctrl->cm_id);
         goto fail;
     }
+
+    init_waitqueue_head(&host_ctrl->sem);
 
     proc_entry = proc_create("cjl_rdma_host", 0666, NULL, &proc_fops);
     if (proc_entry == NULL)
