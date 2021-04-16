@@ -47,7 +47,157 @@ struct cjl_rdma_ctrl
 static struct cjl_rdma_ctrl *host_ctrl;
 static struct proc_dir_entry *proc_entry;
 
-static int cjl_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+static void cjl_rdma_qp_event_handler(struct ib_event *event, void *__unused)
+{
+    info("QP event %s (%d)\n", ib_event_msg(event->event), event->event);
+}
+
+static int cjl_rdma_create_qp(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret;
+    struct ib_qp_init_attr init_attr;
+
+    memset(&init_attr, 0, sizeof(init_attr));
+
+    init_attr.event_handler = cjl_rdma_qp_event_handler;
+    init_attr.cap.max_send_wr = 9;
+    init_attr.cap.max_recv_wr = 3;
+    init_attr.cap.max_recv_sge = 1;
+    init_attr.cap.max_send_sge = 1;
+    init_attr.qp_type = IB_QPT_RC;
+    init_attr.send_cq = ctrl->cq;
+    init_attr.recv_cq = ctrl->cq;
+    init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+
+    ret = rdma_create_qp(ctrl->cm_id, ctrl->pd, &init_attr);
+    ctrl->qp = ctrl->cm_id->qp;
+    return ret;
+}
+
+static int cjl_rdma_create_queues(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+
+    ctrl->pd = ib_alloc_pd(ctrl->cm_id->device, 0);
+    if (IS_ERR_OR_NULL(ctrl->pd))
+    {
+        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(ctrl->pd));
+        ret = PTR_ERR_OR_ZERO(ctrl->pd);
+        goto out;
+    }
+
+    ctrl->cq = ib_alloc_cq(ctrl->cm_id->device, ctrl, 9, 0, IB_POLL_SOFTIRQ);
+    if (IS_ERR_OR_NULL(ctrl->cq))
+    {
+        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(ctrl->cq));
+        ret = PTR_ERR_OR_ZERO(ctrl->cq);
+        goto dealloc_pd;
+    }
+
+    ret = cjl_rdma_create_qp(ctrl);
+    if (ret)
+    {
+        error("Failed to create qp, error code: %d\n", ret);
+        goto destroy_cq;
+    }
+
+    return 0;
+
+destroy_cq:
+    ib_destroy_cq(ctrl->cq);
+dealloc_pd:
+    ib_dealloc_pd(ctrl->pd);
+out:
+    return ret;
+}
+
+static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl)
+{
+    rdma_destroy_qp(ctrl->cm_id);
+    ib_destroy_cq(ctrl->cq);
+    ib_dealloc_pd(ctrl->pd);
+}
+
+static int cjl_rdma_addr_resolved(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret;
+    ctrl->state = ADDR_RESOLVED;
+
+    ret = cjl_rdma_create_queues(ctrl);
+    if (ret)
+    {
+        error("Failed to create queues for ctrl\n");
+        ctrl->state = ERROR;
+        goto out;
+    }
+
+    ret = rdma_resolve_route(ctrl->cm_id, RDMA_TIMEOUT);
+    if (ret)
+    {
+        error("Failed to resolve route to target: \"%s\"\n", ctrl->target_str);
+        cjl_rdma_destroy_queues(ctrl);
+        ctrl->state = ERROR;
+    }
+
+out:
+    return ret;
+}
+
+static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+    info("RECV done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+}
+
+static int cjl_rdma_route_resolved(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+    struct rdma_conn_param param;
+
+    ctrl->state = ROUTE_RESOLVED;
+
+    memset(&param, 0, sizeof(param));
+    param.responder_resources = 1;
+    param.initiator_depth = 1;
+    param.retry_count = 5;
+    param.qp_num = ctrl->qp->qp_num;
+    param.flow_control = 1;
+
+    ret = rdma_connect(ctrl->cm_id, &param);
+    if (ret)
+    {
+        error("Failed to connect to target: \"%s\"\n", ctrl->target_str);
+        cjl_rdma_destroy_queues(ctrl);
+        ctrl->state = ERROR;
+    }
+
+    return ret;
+}
+
+static int cjl_rdma_connected(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+    struct ib_recv_wr recv_wr, *bad_wr;
+
+    ctrl->state = CONNECTED;
+
+    memset(&recv_wr, 0, sizeof(recv_wr));
+    recv_wr.wr_cqe->done = cjl_rdma_recv_done;
+    ret = ib_post_recv(ctrl->qp, &recv_wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post recv wr\n");
+        cjl_rdma_destroy_queues(ctrl);
+        ctrl->state = ERROR;
+        goto out;
+    }
+
+    wake_up_interruptible(&ctrl->sem);
+
+out:
+    return ret;
+}
+
+static int cjl_rdma_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 {
     int ret = 0;
     struct cjl_rdma_ctrl *ctrl = cma_id->context;
@@ -55,32 +205,34 @@ static int cjl_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event
     switch (event->event)
     {
     case RDMA_CM_EVENT_ADDR_RESOLVED:
-        ctrl->state = ADDR_RESOLVED;
-        wake_up_interruptible(&ctrl->sem);
+        ret = cjl_rdma_addr_resolved(ctrl);
         break;
     case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        ctrl->state = ROUTE_RESOLVED;
-        wake_up_interruptible(&ctrl->sem);
+        ret = cjl_rdma_route_resolved(ctrl);
         break;
     case RDMA_CM_EVENT_ESTABLISHED:
-        ctrl->state = CONNECTED;
-        wake_up_interruptible(&ctrl->sem);
+        ret = cjl_rdma_connected(ctrl);
         break;
     case RDMA_CM_EVENT_ADDR_ERROR:
     case RDMA_CM_EVENT_ROUTE_ERROR:
     case RDMA_CM_EVENT_CONNECT_ERROR:
     case RDMA_CM_EVENT_UNREACHABLE:
     case RDMA_CM_EVENT_REJECTED:
-        error("RDMA error: %d\n", event->event);
+        error("RDMA_CM_EVENT_ERROR: %s (%d)\n", rdma_event_msg(event->event), event->event);
+        if (ctrl->state >= ADDR_RESOLVED && ctrl->state < ERROR)
+            cjl_rdma_destroy_queues(ctrl);
         ctrl->state = ERROR;
-        wake_up_interruptible(&ctrl->sem);
         break;
     case RDMA_CM_EVENT_DISCONNECTED:
         break;
     default:
         break;
     }
-    return 0;
+
+    if (ctrl->state == ERROR)
+        wake_up_interruptible(&ctrl->sem);
+
+    return ret;
 }
 
 static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
@@ -133,7 +285,7 @@ out:
     return ret;
 }
 
-static int cjl_rdma_resolve_route(const char *addr, size_t len)
+static int cjl_rdma_connect(const char *addr, size_t len)
 {
     int ret = 0;
     struct sockaddr_in sin;
@@ -142,156 +294,27 @@ static int cjl_rdma_resolve_route(const char *addr, size_t len)
     if (ret)
         goto out;
 
-    ret = rdma_resolve_addr(host_ctrl->cm_id, NULL, (struct sockaddr *)&sin, RDMA_TIMEOUT);
-    if (ret)
-        goto resolve_addr_error;
-
-    ret = wait_event_interruptible(host_ctrl->sem, host_ctrl->state >= ADDR_RESOLVED);
-    if (host_ctrl->state == ERROR)
-        goto resolve_addr_error;
-
-    info("Address resolved\n");
-
-    ret = rdma_resolve_route(host_ctrl->cm_id, RDMA_TIMEOUT);
-    if (ret)
-        goto resolve_route_error;
-
-    ret = wait_event_interruptible(host_ctrl->sem, host_ctrl->state >= ROUTE_RESOLVED);
-    if (host_ctrl->state == ERROR)
-        goto resolve_route_error;
-
-    info("Route resolved\n");
-    return 0;
-
-resolve_addr_error:
-    error("Failed to resolve target addr \"%s\"\n", host_ctrl->target_str);
-    goto out;
-resolve_route_error:
-    error("Failed to resolve route to target addr \"%s\"\n", host_ctrl->target_str);
-out:
-    return ret;
-}
-
-static int cjl_rdma_create_qp(void)
-{
-    int ret;
-    struct ib_qp_init_attr init_attr;
-
-    memset(&init_attr, 0, sizeof(init_attr));
-    init_attr.cap.max_send_wr = 3;
-    init_attr.cap.max_recv_wr = 3;
-    init_attr.cap.max_recv_sge = 1;
-    init_attr.cap.max_send_sge = 1;
-    init_attr.qp_type = IB_QPT_RC;
-    init_attr.send_cq = host_ctrl->cq;
-    init_attr.recv_cq = host_ctrl->cq;
-    init_attr.sq_sig_type = IB_SIGNAL_ALL_WR;
-
-    ret = rdma_create_qp(host_ctrl->cm_id, host_ctrl->pd, &init_attr);
-    if (!ret)
-        host_ctrl->qp = host_ctrl->cm_id->qp;
-    
-    return ret;
-}
-
-static int cjl_rdma_setup_queues(void)
-{
-    int ret = 0;
-
-    host_ctrl->pd = ib_alloc_pd(host_ctrl->cm_id->device, 0);
-    if (IS_ERR_OR_NULL(host_ctrl->pd))
-    {
-        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(host_ctrl->pd));
-        ret = PTR_ERR_OR_ZERO(host_ctrl->pd);
-        goto out;
-    }
-
-    host_ctrl->cq = ib_alloc_cq(host_ctrl->cm_id->device, host_ctrl, 3, 0, IB_POLL_SOFTIRQ);
-    if (IS_ERR_OR_NULL(host_ctrl->cq))
-    {
-        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(host_ctrl->cq));
-        ret = PTR_ERR_OR_ZERO(host_ctrl->cq);
-        goto dealloc_pd;
-    }
-
-    ret = cjl_rdma_create_qp();
-    if (ret)
-    {
-        error("Failed to create qp: %d\n", ret);
-        goto destroy_cq;
-    }
-
-    return 0;
-
-dealloc_pd:
-    ib_dealloc_pd(host_ctrl->pd);
-destroy_cq:
-    ib_destroy_cq(host_ctrl->cq);
-out:
-    return ret;
-}
-
-static void cjl_rdma_destroy_queues(void) {
-    ib_dealloc_pd(host_ctrl->pd);
-    ib_destroy_cq(host_ctrl->cq);
-    rdma_destroy_qp(host_ctrl->cm_id);
-}
-
-static void cjl_rdma_connect_rsp(struct ib_cq *cq, struct ib_wc *wc) {
-    return;
-}
-
-static int cjl_rdma_connect(const char *addr, size_t len)
-{
-    int ret = 0;
-    struct ib_recv_wr recv_wr, *bad_wr;
-    struct rdma_conn_param conn_param;
-
     info("Connecting to target: %s\n", addr);
 
-    ret = cjl_rdma_resolve_route(addr, len);
+    ret = rdma_resolve_addr(host_ctrl->cm_id, NULL, (struct sockaddr *)&sin, RDMA_TIMEOUT);
     if (ret)
+    {
+        error("Failed to resolve target address: \"%s\"\n", host_ctrl->target_str);
         goto out;
-
-    info("Setting up queues\n");
-
-    ret = cjl_rdma_setup_queues();
-    if (ret)
-        goto out;
-
-    memset(&recv_wr, 0, sizeof(recv_wr));
-    recv_wr.wr_cqe->done = cjl_rdma_connect_rsp;
-
-    info("Post recv\n");
-
-    ret = ib_post_recv(host_ctrl->qp, &recv_wr, &bad_wr);
-    if (ret) {
-        goto destroy_queues;
-    }
-
-    memset(&conn_param, 0, sizeof(conn_param));
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
-	conn_param.retry_count = 10;
-
-    info("Connecting\n");
-
-    ret = rdma_connect(host_ctrl->cm_id, &conn_param);
-    if (ret) {
-        goto destroy_queues;
     }
 
     ret = wait_event_interruptible(host_ctrl->sem, host_ctrl->state >= CONNECTED);
-	if (host_ctrl->state == ERROR) {
-		error("Failed to connect to target: \"%s\"\n", host_ctrl->target_str);
-		goto out;
-	}
+    if (ret || host_ctrl->state == ERROR)
+    {
+        error("Failed to connect to target: \"%s\"\n", host_ctrl->target_str);
+        goto out;
+    }
 
-    info("Connected to target: \"%s\"\n", host_ctrl->target_str);
-    return 0;
+    info("Connected to target: %s\n", addr);
 
-destroy_queues:
-    cjl_rdma_destroy_queues();
+    // FIXME: remove this after debugging.
+    cjl_rdma_destroy_queues(host_ctrl);
+
 out:
     return ret;
 }
@@ -458,7 +481,7 @@ static int __init host_init(void)
 
     memset(host_ctrl, 0, sizeof(*host_ctrl));
 
-    host_ctrl->cm_id = rdma_create_id(&init_net, cjl_cma_event_handler, host_ctrl, RDMA_PS_TCP, IB_QPT_RC);
+    host_ctrl->cm_id = rdma_create_id(&init_net, cjl_rdma_cma_event_handler, host_ctrl, RDMA_PS_TCP, IB_QPT_RC);
     if (IS_ERR_OR_NULL(host_ctrl->cm_id))
     {
         error("Failed to create CM ID: %d\n", PTR_ERR_OR_ZERO(host_ctrl->cm_id));
