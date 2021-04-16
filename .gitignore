@@ -12,5 +12,7 @@ modules.order
 .tmp_versions/
 
 # VSCode settings
-
 .vscode/
+
+# Configuration file
+address.txt

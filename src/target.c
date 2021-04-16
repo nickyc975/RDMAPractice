@@ -22,18 +22,16 @@ MODULE_LICENSE("GPL v2");
 enum cjl_rdma_state
 {
     INITIATED,
-    ADDR_RESOLVED,
-    ROUTE_RESOLVED,
-    CONNECTING,
+    CONNECT_REQUEST,
     CONNECTED,
     ERROR,
 };
 
 struct cjl_rdma_ctrl
 {
-    char *target_str;
-    u8 target_addr[4];
-    u16 target_port;
+    char *addr_str;
+    u8 addr[4];
+    u16 port;
 
     struct ib_qp *qp;
     struct ib_cq *cq;
@@ -48,44 +46,163 @@ struct cjl_rdma_ctrl
 static struct cjl_rdma_ctrl *target_ctrl;
 static struct proc_dir_entry *proc_entry;
 
-static int cjl_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+static void cjl_rdma_qp_event_handler(struct ib_event *event, void *__unused)
+{
+    info("QP event %s (%d)\n", ib_event_msg(event->event), event->event);
+}
+
+static int cjl_rdma_create_qp(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret;
+    struct ib_qp_init_attr init_attr;
+
+    memset(&init_attr, 0, sizeof(init_attr));
+
+    init_attr.qp_context = ctrl;
+    init_attr.event_handler = cjl_rdma_qp_event_handler;
+    init_attr.cap.max_send_wr = 9;
+    init_attr.cap.max_recv_wr = 3;
+    init_attr.cap.max_recv_sge = 1;
+    init_attr.cap.max_send_sge = 1;
+    init_attr.qp_type = IB_QPT_RC;
+    init_attr.send_cq = ctrl->cq;
+    init_attr.recv_cq = ctrl->cq;
+    init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+
+    ret = rdma_create_qp(ctrl->cm_id, ctrl->pd, &init_attr);
+    ctrl->qp = ctrl->cm_id->qp;
+    return ret;
+}
+
+static int cjl_rdma_create_queues(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+
+    ctrl->pd = ib_alloc_pd(ctrl->cm_id->device, 0);
+    if (IS_ERR_OR_NULL(ctrl->pd))
+    {
+        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(ctrl->pd));
+        ret = PTR_ERR_OR_ZERO(ctrl->pd);
+        goto out;
+    }
+
+    ctrl->cq = ib_alloc_cq(ctrl->cm_id->device, ctrl, 9, 1, IB_POLL_SOFTIRQ);
+    if (IS_ERR_OR_NULL(ctrl->cq))
+    {
+        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(ctrl->cq));
+        ret = PTR_ERR_OR_ZERO(ctrl->cq);
+        goto dealloc_pd;
+    }
+
+    ret = cjl_rdma_create_qp(ctrl);
+    if (ret)
+    {
+        error("Failed to create qp, error code: %d\n", ret);
+        goto destroy_cq;
+    }
+
+    return 0;
+
+destroy_cq:
+    ib_destroy_cq(ctrl->cq);
+dealloc_pd:
+    ib_dealloc_pd(ctrl->pd);
+out:
+    return ret;
+}
+
+static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl) {
+    rdma_destroy_qp(ctrl->cm_id);
+    ib_destroy_cq(ctrl->cq);
+    ib_dealloc_pd(ctrl->pd);
+}
+
+static int cjl_rdma_connect_request(struct cjl_rdma_ctrl *ctrl, struct rdma_cm_event *event) {
+    int ret = 0;
+    ctrl->state = CONNECT_REQUEST;
+
+    ret = cjl_rdma_create_queues(ctrl);
+    if (ret)
+    {
+        error("Failed to create queues for ctrl\n");
+        ctrl->state = ERROR;
+        goto out;
+    }
+
+    ret = rdma_accept(ctrl->cm_id, &(event->param.conn));
+    if (ret)
+    {
+        error("Failed to accept host, error code: %d\n", ret);
+        cjl_rdma_destroy_queues(ctrl);
+        ctrl->state = ERROR;
+    }
+
+out:
+    return ret;
+}
+
+static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+    info("RECV done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+}
+
+static int cjl_rdma_connected(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+    struct ib_recv_wr recv_wr, *bad_wr;
+
+    ctrl->state = CONNECTED;
+
+    memset(&recv_wr, 0, sizeof(recv_wr));
+    recv_wr.wr_cqe->done = cjl_rdma_recv_done;
+    ret = ib_post_recv(ctrl->qp, &recv_wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post recv wr\n");
+        cjl_rdma_destroy_queues(ctrl);
+        ctrl->state = ERROR;
+        goto out;
+    }
+
+    wake_up_interruptible(&ctrl->sem);
+
+out:
+    return ret;
+}
+
+static int cjl_rdma_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 {
     int ret = 0;
     struct cjl_rdma_ctrl *ctrl = cma_id->context;
 
     switch (event->event)
     {
-    case RDMA_CM_EVENT_ADDR_RESOLVED:
-        ctrl->state = ADDR_RESOLVED;
-        wake_up_interruptible(&ctrl->sem);
-        break;
-    case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        ctrl->state = ROUTE_RESOLVED;
-        wake_up_interruptible(&ctrl->sem);
-        break;
     case RDMA_CM_EVENT_CONNECT_REQUEST:
-        ctrl->state = CONNECTING;
-        wake_up_interruptible(&ctrl->sem);
+        ret = cjl_rdma_connect_request(ctrl, event);
         break;
     case RDMA_CM_EVENT_ESTABLISHED:
-        ctrl->state = CONNECTED;
-        wake_up_interruptible(&ctrl->sem);
+        ret = cjl_rdma_connected(ctrl);
         break;
     case RDMA_CM_EVENT_ADDR_ERROR:
     case RDMA_CM_EVENT_ROUTE_ERROR:
     case RDMA_CM_EVENT_CONNECT_ERROR:
     case RDMA_CM_EVENT_UNREACHABLE:
     case RDMA_CM_EVENT_REJECTED:
-        error("RDMA error: %d\n", event->event);
+        error("RDMA_CM_EVENT_ERROR: %s (%d)\n", rdma_event_msg(event->event), event->event);
+        if (ctrl->state >= CONNECT_REQUEST && ctrl->state < ERROR)
+            cjl_rdma_destroy_queues(ctrl);
         ctrl->state = ERROR;
-        wake_up_interruptible(&ctrl->sem);
         break;
     case RDMA_CM_EVENT_DISCONNECTED:
         break;
     default:
         break;
     }
-    return 0;
+
+    if (ctrl->state == ERROR)
+        wake_up_interruptible(&ctrl->sem);
+
+    return ret;
 }
 
 static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
@@ -106,14 +223,14 @@ static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
         goto out;
     }
 
-    if (!in4_pton(addr, delim_pos, target_ctrl->target_addr, -1, &end))
+    if (!in4_pton(addr, delim_pos, target_ctrl->addr, -1, &end))
     {
         error("Error parsing address: \"%s\", last char: %c\n", addr, *end);
         ret = -EINVAL;
         goto out;
     }
 
-    ret = kstrtou16(addr + delim_pos + 1, 10, &target_ctrl->target_port);
+    ret = kstrtou16(addr + delim_pos + 1, 10, &target_ctrl->port);
     if (ret)
     {
         error("Invalid port: \"%s\"\n", addr + delim_pos + 1);
@@ -121,24 +238,25 @@ static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
     }
 
     sin->sin_family = AF_INET;
-    memcpy((void *)&sin->sin_addr.s_addr, &target_ctrl->target_addr, 4);
-    sin->sin_port = target_ctrl->target_port;
+    memcpy((void *)&sin->sin_addr.s_addr, &target_ctrl->addr, 4);
+    sin->sin_port = target_ctrl->port;
 
-    target_ctrl->target_str = kmalloc(len + 1, GFP_KERNEL);
-    if (target_ctrl->target_str == NULL)
+    target_ctrl->addr_str = kmalloc(len + 1, GFP_KERNEL);
+    if (target_ctrl->addr_str == NULL)
     {
-        error("Failed to allocate memory for target_str\n");
+        error("Failed to allocate memory for addr_str\n");
         ret = -ENOMEM;
         goto out;
     }
-    memcpy(target_ctrl->target_str, addr, len);
-    target_ctrl->target_str[len] = '\0';
+    memcpy(target_ctrl->addr_str, addr, len);
+    target_ctrl->addr_str[len] = '\0';
 
 out:
     return ret;
 }
 
-static int cjl_rdma_listen(const char *addr, size_t len)
+
+static int cjl_rdma_accept(const char *addr, size_t len)
 {
     int ret = 0;
     struct sockaddr_in sin;
@@ -150,154 +268,37 @@ static int cjl_rdma_listen(const char *addr, size_t len)
     ret = rdma_bind_addr(target_ctrl->cm_id, (struct sockaddr *)&sin);
     if (ret)
     {
-        error("Failed to bind to addr: %s\n", target_ctrl->target_addr);
+        error("Failed to bind to addr: %s\n", target_ctrl->addr);
         goto out;
     }
-
-    ret = rdma_listen(target_ctrl->cm_id, 3);
-    if (ret)
-    {
-        error("Failed to listen at addr: %s\n", target_ctrl->target_addr);
-        goto out;
-    }
-
-    ret = wait_event_interruptible(target_ctrl->sem, target_ctrl->state >= CONNECTING);
-    if (target_ctrl->state == ERROR)
-        goto out;
-
-    info("Heard host\n");
-    return 0;
-
-out:
-    return ret;
-}
-
-static int cjl_rdma_create_qp(void)
-{
-    int ret;
-    struct ib_qp_init_attr init_attr;
-
-    memset(&init_attr, 0, sizeof(init_attr));
-    init_attr.cap.max_send_wr = 3;
-    init_attr.cap.max_recv_wr = 3;
-    init_attr.cap.max_recv_sge = 1;
-    init_attr.cap.max_send_sge = 1;
-    init_attr.qp_type = IB_QPT_RC;
-    init_attr.send_cq = target_ctrl->cq;
-    init_attr.recv_cq = target_ctrl->cq;
-    init_attr.sq_sig_type = IB_SIGNAL_ALL_WR;
-
-    ret = rdma_create_qp(target_ctrl->cm_id, target_ctrl->pd, &init_attr);
-    if (!ret)
-        target_ctrl->qp = target_ctrl->cm_id->qp;
-    
-    return ret;
-}
-
-static int cjl_rdma_setup_queues(void)
-{
-    int ret = 0;
-
-    target_ctrl->pd = ib_alloc_pd(target_ctrl->cm_id->device, 0);
-    if (IS_ERR_OR_NULL(target_ctrl->pd))
-    {
-        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(target_ctrl->pd));
-        ret = PTR_ERR_OR_ZERO(target_ctrl->pd);
-        goto out;
-    }
-
-    target_ctrl->cq = ib_alloc_cq(target_ctrl->cm_id->device, target_ctrl, 3, 0, IB_POLL_SOFTIRQ);
-    if (IS_ERR_OR_NULL(target_ctrl->cq))
-    {
-        error("Failed to allocate pd: %d\n", PTR_ERR_OR_ZERO(target_ctrl->cq));
-        ret = PTR_ERR_OR_ZERO(target_ctrl->cq);
-        goto dealloc_pd;
-    }
-
-    ret = cjl_rdma_create_qp();
-    if (ret)
-    {
-        error("Failed to create qp: %d\n", ret);
-        goto destroy_cq;
-    }
-
-    return 0;
-
-dealloc_pd:
-    ib_dealloc_pd(target_ctrl->pd);
-destroy_cq:
-    ib_destroy_cq(target_ctrl->cq);
-out:
-    return ret;
-}
-
-static void cjl_rdma_destroy_queues(void) {
-    ib_dealloc_pd(target_ctrl->pd);
-    ib_destroy_cq(target_ctrl->cq);
-    rdma_destroy_qp(target_ctrl->cm_id);
-}
-
-static void cjl_rdma_connect_rsp(struct ib_cq *cq, struct ib_wc *wc) {
-    return;
-}
-
-static int cjl_rdma_accept(const char *addr, size_t len)
-{
-    int ret = 0;
-    struct ib_recv_wr recv_wr, *bad_wr;
-    struct rdma_conn_param conn_param;
 
     info("Listening at address: %s\n", addr);
 
-    ret = cjl_rdma_listen(addr, len);
+    ret = rdma_listen(target_ctrl->cm_id, 128);
     if (ret)
+    {
+        error("Failed to listen at addr: %s\n", target_ctrl->addr);
         goto out;
-
-    info("Setting up queues\n");
-
-    ret = cjl_rdma_setup_queues();
-    if (ret)
-        goto out;
-
-    memset(&recv_wr, 0, sizeof(recv_wr));
-    recv_wr.wr_cqe->done = cjl_rdma_connect_rsp;
-
-    info("Post recv\n");
-
-    ret = ib_post_recv(target_ctrl->qp, &recv_wr, &bad_wr);
-    if (ret) {
-        goto destroy_queues;
-    }
-
-    memset(&conn_param, 0, sizeof(conn_param));
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
-
-    info("Accepting\n");
-
-    ret = rdma_accept(target_ctrl->cm_id, &conn_param);
-    if (ret) {
-        goto destroy_queues;
     }
 
     ret = wait_event_interruptible(target_ctrl->sem, target_ctrl->state >= CONNECTED);
-	if (target_ctrl->state == ERROR) {
-		error("Failed to accept at: \"%s\"\n", target_ctrl->target_str);
+	if (ret || target_ctrl->state == ERROR) {
+		error("Failed to accept at: \"%s\"\n", target_ctrl->addr_str);
 		goto out;
 	}
 
     info("Host connected\n");
-    return 0;
 
-destroy_queues:
-    cjl_rdma_destroy_queues();
+    // FIXME: remove this after debugging.
+    cjl_rdma_destroy_queues(target_ctrl);
+
 out:
     return ret;
 }
 
 static void cjl_rdma_disconnect(void)
 {
-    kfree(target_ctrl->target_str);
+    kfree(target_ctrl->addr_str);
     target_ctrl->state = INITIATED;
     return;
 }
@@ -457,7 +458,7 @@ static int __init target_init(void)
 
     memset(target_ctrl, 0, sizeof(*target_ctrl));
 
-    target_ctrl->cm_id = rdma_create_id(&init_net, cjl_cma_event_handler, target_ctrl, RDMA_PS_TCP, IB_QPT_RC);
+    target_ctrl->cm_id = rdma_create_id(&init_net, cjl_rdma_cma_event_handler, target_ctrl, RDMA_PS_TCP, IB_QPT_RC);
     if (IS_ERR_OR_NULL(target_ctrl->cm_id))
     {
         error("Failed to create CM ID: %d\n", PTR_ERR_OR_ZERO(target_ctrl->cm_id));

@@ -18,5 +18,11 @@ install_target: default
 
 install: install_target install_host
 
+listen: install_target
+	@echo l $(shell cat address.txt) > /proc/cjl_rdma_target
+
+connect: install_host
+	@echo c $(shell cat address.txt) > /proc/cjl_rdma_host
+
 clean:
 	make -C /lib/modules/$(KHEADERS)/build M=$(PWD) clean
