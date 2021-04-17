@@ -176,20 +176,20 @@ static int cjl_rdma_route_resolved(struct cjl_rdma_ctrl *ctrl)
 static int cjl_rdma_connected(struct cjl_rdma_ctrl *ctrl)
 {
     int ret = 0;
-    struct ib_recv_wr recv_wr, *bad_wr;
+    // struct ib_recv_wr recv_wr, *bad_wr;
 
     ctrl->state = CONNECTED;
 
-    memset(&recv_wr, 0, sizeof(recv_wr));
-    recv_wr.wr_cqe->done = cjl_rdma_recv_done;
-    ret = ib_post_recv(ctrl->qp, &recv_wr, &bad_wr);
-    if (ret)
-    {
-        error("Failed to post recv wr\n");
-        cjl_rdma_destroy_queues(ctrl);
-        ctrl->state = ERROR;
-        goto out;
-    }
+    // memset(&recv_wr, 0, sizeof(recv_wr));
+    // recv_wr.wr_cqe->done = cjl_rdma_recv_done;
+    // ret = ib_post_recv(ctrl->qp, &recv_wr, &bad_wr);
+    // if (ret)
+    // {
+    //     error("Failed to post recv wr\n");
+    //     cjl_rdma_destroy_queues(ctrl);
+    //     ctrl->state = ERROR;
+    //     goto out;
+    // }
 
     wake_up_interruptible(&ctrl->sem);
 
@@ -313,7 +313,7 @@ static int cjl_rdma_connect(const char *addr, size_t len)
     info("Connected to target: %s\n", addr);
 
     // FIXME: remove this after debugging.
-    cjl_rdma_destroy_queues(host_ctrl);
+    // cjl_rdma_destroy_queues(host_ctrl);
 
 out:
     return ret;
