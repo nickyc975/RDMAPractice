@@ -27,6 +27,13 @@ enum cjl_rdma_state
     ERROR,
 };
 
+struct cjl_rdma_info
+{
+    uint64_t buff;
+    uint32_t rkey;
+    uint32_t size;
+};
+
 struct cjl_rdma_ctrl
 {
     char *addr_str;
@@ -42,6 +49,26 @@ struct cjl_rdma_ctrl
 
     wait_queue_head_t sem;
     enum cjl_rdma_state state;
+
+    struct ib_recv_wr recv_wr;
+    struct ib_sge recv_sge;
+    struct cjl_rdma_info recv_buff __aligned(16);
+    u64 recv_dma_addr;
+
+    struct ib_send_wr send_wr;
+    struct ib_sge send_sge;
+    struct cjl_rdma_info send_buff __aligned(16);
+    u64 send_dma_addr;
+
+    struct ib_rdma_wr rdma_wr;
+    struct ib_sge rdma_sge;
+    char *rdma_buff;
+
+#define CJL_RDMA_BUFF_SIZE 4096
+#define CJL_RDMA_MAX_NUM_SG (((CJL_RDMA_BUFF_SIZE - 1) & PAGE_MASK) + PAGE_SIZE) >> PAGE_SHIFT
+
+    u64 rdma_dma_addr;
+    struct ib_mr *rdma_mr;
 };
 
 static struct cjl_rdma_ctrl *target_ctrl;
@@ -118,6 +145,82 @@ static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl) {
     ib_dealloc_pd(ctrl->pd);
 }
 
+static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+    info("RECV done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+}
+
+static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
+{
+    // Setup recv wr.
+    ctrl->recv_sge.addr = ctrl->recv_dma_addr;
+    ctrl->recv_sge.length = sizeof(ctrl->recv_buff);
+    ctrl->recv_sge.lkey = ctrl->pd->local_dma_lkey;
+    ctrl->recv_wr.wr_cqe->done = cjl_rdma_recv_done;
+    ctrl->recv_wr.sg_list = &ctrl->recv_sge;
+    ctrl->recv_wr.num_sge = 1;
+
+    // Setup send wr.
+    ctrl->send_sge.addr = ctrl->send_dma_addr;
+    ctrl->send_sge.length = sizeof(ctrl->send_buff);
+    ctrl->send_sge.lkey = ctrl->pd->local_dma_lkey;
+    ctrl->send_wr.opcode = IB_WR_SEND;
+    ctrl->send_wr.send_flags = IB_SEND_SIGNALED;
+    ctrl->send_wr.sg_list = &ctrl->send_sge;
+    ctrl->send_wr.num_sge = 1;
+}
+
+static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+
+    ctrl->recv_dma_addr = ib_dma_map_single(ctrl->pd->device,
+                                            &ctrl->recv_buff, sizeof(ctrl->recv_buff), DMA_BIDIRECTIONAL);
+    ctrl->send_dma_addr = ib_dma_map_single(ctrl->pd->device,
+                                            &ctrl->send_buff, sizeof(ctrl->send_buff), DMA_BIDIRECTIONAL);
+
+    ctrl->rdma_buff = ib_dma_alloc_coherent(ctrl->pd->device,
+                                            CJL_RDMA_BUFF_SIZE, &ctrl->rdma_dma_addr, GFP_KERNEL);
+    if (ctrl->rdma_buff == NULL)
+    {
+        error("Failed to allocate memory for rdma_buff\n");
+        ret = -ENOMEM;
+        goto unmap;
+    }
+
+    ctrl->rdma_mr = ib_alloc_mr(ctrl->pd, IB_MR_TYPE_MEM_REG, CJL_RDMA_MAX_NUM_SG);
+    if (IS_ERR_OR_NULL(ctrl->rdma_mr))
+    {
+        error("Failed to register memory region\n");
+        ret = PTR_ERR_OR_ZERO(ctrl->rdma_mr);
+        goto free_rdma_buff;
+    }
+
+    cjl_rdma_setup_wrs(ctrl);
+
+    return 0;
+
+free_rdma_buff:
+    ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
+                         ctrl->rdma_buff, ctrl->rdma_dma_addr);
+unmap:
+    ib_dma_unmap_single(ctrl->pd->device, ctrl->recv_dma_addr,
+                        sizeof(ctrl->recv_buff), DMA_BIDIRECTIONAL);
+    ib_dma_unmap_single(ctrl->pd->device, ctrl->send_dma_addr,
+                        sizeof(ctrl->send_buff), DMA_BIDIRECTIONAL);
+    return ret;
+}
+
+static void cjl_rdma_free_buffers(struct cjl_rdma_ctrl *ctrl)
+{
+    ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
+                         ctrl->rdma_buff, ctrl->rdma_dma_addr);
+    ib_dma_unmap_single(ctrl->pd->device, ctrl->recv_dma_addr,
+                        sizeof(ctrl->recv_buff), DMA_BIDIRECTIONAL);
+    ib_dma_unmap_single(ctrl->pd->device, ctrl->send_dma_addr,
+                        sizeof(ctrl->send_buff), DMA_BIDIRECTIONAL);
+}
+
 static int cjl_rdma_connect_request(struct cjl_rdma_ctrl *ctrl, struct rdma_cm_event *event) {
     int ret = 0;
     ctrl->state = CONNECT_REQUEST;
@@ -126,6 +229,14 @@ static int cjl_rdma_connect_request(struct cjl_rdma_ctrl *ctrl, struct rdma_cm_e
     if (ret)
     {
         error("Failed to create queues for ctrl\n");
+        ctrl->state = ERROR;
+        goto out;
+    }
+
+    ret = cjl_rdma_alloc_buffers(ctrl);
+    if (ret)
+    {
+        error("Failed to setup buffers\n");
         ctrl->state = ERROR;
         goto out;
     }
@@ -142,28 +253,18 @@ out:
     return ret;
 }
 
-static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
-{
-    info("RECV done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
-}
-
 static int cjl_rdma_connected(struct cjl_rdma_ctrl *ctrl)
 {
     int ret = 0;
-    // struct ib_recv_wr recv_wr, *bad_wr;
+    const struct ib_recv_wr *bad_wr;
 
     ctrl->state = CONNECTED;
-
-    // memset(&recv_wr, 0, sizeof(recv_wr));
-    // recv_wr.wr_cqe->done = cjl_rdma_recv_done;
-    // ret = ib_post_recv(ctrl->qp, &recv_wr, &bad_wr);
-    // if (ret)
-    // {
-    //     error("Failed to post recv wr\n");
-    //     cjl_rdma_destroy_queues(ctrl);
-    //     ctrl->state = ERROR;
-    //     goto out;
-    // }
+    ret = ib_post_recv(ctrl->qp, &ctrl->recv_wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post recv wr\n");
+        goto out;
+    }
 
     wake_up_interruptible(&ctrl->sem);
 
@@ -192,7 +293,10 @@ static int cjl_rdma_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_
     case RDMA_CM_EVENT_REJECTED:
         error("RDMA_CM_EVENT_ERROR: %s (%d)\n", rdma_event_msg(event->event), event->event);
         if (ctrl->state >= CONNECT_REQUEST && ctrl->state < ERROR)
+        {
+            cjl_rdma_free_buffers(ctrl);
             cjl_rdma_destroy_queues(ctrl);
+        }
         ctrl->state = ERROR;
         break;
     case RDMA_CM_EVENT_DISCONNECTED:
@@ -209,7 +313,7 @@ static int cjl_rdma_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_
 
 static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
 {
-    char *end = NULL;
+    const char *end;
     size_t delim_pos = 0;
 
     int ret = 0;
@@ -257,6 +361,14 @@ out:
     return ret;
 }
 
+static void cjl_rdma_disconnect(void)
+{
+    rdma_disconnect(target_ctrl->conn_cm_id);
+    cjl_rdma_free_buffers(target_ctrl);
+    cjl_rdma_destroy_queues(target_ctrl);
+    kfree(target_ctrl->addr_str);
+    target_ctrl->state = INITIATED;
+}
 
 static int cjl_rdma_accept(const char *addr, size_t len)
 {
@@ -292,17 +404,10 @@ static int cjl_rdma_accept(const char *addr, size_t len)
     info("Host connected\n");
 
     // FIXME: remove this after debugging.
-    // cjl_rdma_destroy_queues(target_ctrl);
+    cjl_rdma_disconnect();
 
 out:
     return ret;
-}
-
-static void cjl_rdma_disconnect(void)
-{
-    kfree(target_ctrl->addr_str);
-    target_ctrl->state = INITIATED;
-    return;
 }
 
 static inline int cjl_skip_spaces(const char *str, size_t len, size_t *ppos)
@@ -491,12 +596,8 @@ out:
 static void __exit target_exit(void)
 {
     remove_proc_entry(PROC_ENTRY_NAME, NULL);
-    // FIXME: enable state check after connecting implemented
-    // if (target_ctrl->state == CONNECTED)
-    // {
-    //     cjl_rdma_disconnect();
-    // }
-    cjl_rdma_disconnect();
+    if (target_ctrl->state == CONNECTED)
+        cjl_rdma_disconnect();
     rdma_destroy_id(target_ctrl->cm_id);
     kfree(target_ctrl);
 }
