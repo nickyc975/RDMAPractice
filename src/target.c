@@ -15,6 +15,9 @@
 #define RDMA_TIMEOUT 5000
 #define PROC_ENTRY_NAME "cjl_rdma_target"
 
+#define CJL_RDMA_BUFF_SIZE 4096
+#define CJL_RDMA_MAX_NUM_SG (((CJL_RDMA_BUFF_SIZE - 1) & PAGE_MASK) + PAGE_SIZE) >> PAGE_SHIFT
+
 MODULE_AUTHOR("Chen Jinlong");
 MODULE_DESCRIPTION("RDMA practice project target module.");
 MODULE_LICENSE("GPL v2");
@@ -52,21 +55,20 @@ struct cjl_rdma_ctrl
 
     struct ib_recv_wr recv_wr;
     struct ib_sge recv_sge;
+    struct ib_cqe recv_cqe;
     struct cjl_rdma_info recv_buff __aligned(16);
     u64 recv_dma_addr;
 
     struct ib_send_wr send_wr;
     struct ib_sge send_sge;
+    struct ib_cqe send_cqe;
     struct cjl_rdma_info send_buff __aligned(16);
     u64 send_dma_addr;
 
     struct ib_rdma_wr rdma_wr;
     struct ib_sge rdma_sge;
+    struct ib_cqe rdma_cqe;
     char *rdma_buff;
-
-#define CJL_RDMA_BUFF_SIZE 4096
-#define CJL_RDMA_MAX_NUM_SG (((CJL_RDMA_BUFF_SIZE - 1) & PAGE_MASK) + PAGE_SIZE) >> PAGE_SHIFT
-
     u64 rdma_dma_addr;
     struct ib_mr *rdma_mr;
 };
@@ -156,7 +158,8 @@ static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
     ctrl->recv_sge.addr = ctrl->recv_dma_addr;
     ctrl->recv_sge.length = sizeof(ctrl->recv_buff);
     ctrl->recv_sge.lkey = ctrl->pd->local_dma_lkey;
-    ctrl->recv_wr.wr_cqe->done = cjl_rdma_recv_done;
+    ctrl->recv_cqe.done = cjl_rdma_recv_done;
+    ctrl->recv_wr.wr_cqe = &ctrl->recv_cqe;
     ctrl->recv_wr.sg_list = &ctrl->recv_sge;
     ctrl->recv_wr.num_sge = 1;
 
