@@ -8,6 +8,8 @@
 
 #define PREFIX "cjl RDMA host: "
 
+#define MAX_ADDR_STR_LEN 24
+
 #define info(fmt, ...) printk(KERN_INFO PREFIX fmt, ##__VA_ARGS__)
 #define warn(fmt, ...) printk(KERN_ALERT PREFIX fmt, ##__VA_ARGS__)
 #define error(fmt, ...) printk(KERN_ERR PREFIX fmt, ##__VA_ARGS__)
@@ -43,9 +45,7 @@ struct cjl_rdma_info
 
 struct cjl_rdma_ctrl
 {
-    char *target_str;
-    u8 target_addr[4];
-    u16 target_port;
+    char target_addr[MAX_ADDR_STR_LEN];
 
     struct ib_qp *qp;
     struct ib_cq *cq;
@@ -137,17 +137,22 @@ static int cjl_rdma_create_queues(struct cjl_rdma_ctrl *ctrl)
 
 destroy_cq:
     ib_destroy_cq(ctrl->cq);
+    ctrl->cq = NULL;
 dealloc_pd:
     ib_dealloc_pd(ctrl->pd);
+    ctrl->pd = NULL;
 out:
     return ret;
 }
 
 static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl)
 {
-    rdma_destroy_qp(ctrl->cm_id);
+    ib_destroy_qp(ctrl->qp);
+    ctrl->qp = NULL;
     ib_destroy_cq(ctrl->cq);
+    ctrl->cq = NULL;
     ib_dealloc_pd(ctrl->pd);
+    ctrl->pd = NULL;
 }
 
 static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
@@ -223,6 +228,7 @@ static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
 free_rdma_buff:
     ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
                          ctrl->rdma_buff, ctrl->rdma_dma_addr);
+    ctrl->rdma_buff = NULL;
 unmap:
     ib_dma_unmap_single(ctrl->pd->device, ctrl->recv_dma_addr,
                         sizeof(ctrl->recv_buff), DMA_BIDIRECTIONAL);
@@ -234,8 +240,10 @@ unmap:
 static void cjl_rdma_free_buffers(struct cjl_rdma_ctrl *ctrl)
 {
     ib_dereg_mr(ctrl->rdma_mr);
+    ctrl->rdma_mr = NULL;
     ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
                          ctrl->rdma_buff, ctrl->rdma_dma_addr);
+    ctrl->rdma_buff = NULL;
     ib_dma_unmap_single(ctrl->pd->device, ctrl->recv_dma_addr,
                         sizeof(ctrl->recv_buff), DMA_BIDIRECTIONAL);
     ib_dma_unmap_single(ctrl->pd->device, ctrl->send_dma_addr,
@@ -262,7 +270,7 @@ static int cjl_rdma_addr_resolved(struct cjl_rdma_ctrl *ctrl)
     {
         error("Failed to setup buffers\n");
         ctrl->state = ERROR;
-        goto out;
+        goto destroy_queues;
     }
 
     ret = ib_post_recv(ctrl->qp, &ctrl->recv_wr, &bad_wr);
@@ -270,17 +278,23 @@ static int cjl_rdma_addr_resolved(struct cjl_rdma_ctrl *ctrl)
     {
         error("Failed to post recv wr\n");
         ctrl->state = ERROR;
-        goto out;
+        goto free_buffers;
     }
 
     ret = rdma_resolve_route(ctrl->cm_id, RDMA_TIMEOUT);
     if (ret)
     {
-        error("Failed to resolve route to target: \"%s\"\n", ctrl->target_str);
-        cjl_rdma_destroy_queues(ctrl);
+        error("Failed to resolve route to target: \"%s\"\n", ctrl->target_addr);
         ctrl->state = ERROR;
+        goto free_buffers;
     }
 
+    return 0;
+
+free_buffers:
+    cjl_rdma_free_buffers(ctrl);
+destroy_queues:
+    cjl_rdma_destroy_queues(ctrl);
 out:
     return ret;
 }
@@ -302,7 +316,8 @@ static int cjl_rdma_route_resolved(struct cjl_rdma_ctrl *ctrl)
     ret = rdma_connect(ctrl->cm_id, &param);
     if (ret)
     {
-        error("Failed to connect to target: \"%s\"\n", ctrl->target_str);
+        error("Failed to connect to target: \"%s\"\n", ctrl->target_addr);
+        cjl_rdma_free_buffers(ctrl);
         cjl_rdma_destroy_queues(ctrl);
         ctrl->state = ERROR;
     }
@@ -363,6 +378,7 @@ static int cjl_rdma_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_
         ctrl->state = ERROR;
         break;
     case RDMA_CM_EVENT_DISCONNECTED:
+        error("Unexpected disconnecting: %s (%d)\n", rdma_event_msg(event->event), event->event);
         break;
     default:
         break;
@@ -374,51 +390,47 @@ static int cjl_rdma_cma_event_handler(struct rdma_cm_id *cma_id, struct rdma_cm_
     return ret;
 }
 
-static int parse_addr(const char *addr, size_t len, struct sockaddr_in *sin)
+static int parse_addr(const char *addr_str, size_t len, struct sockaddr_in *sin)
 {
+    u8 addr[4] = {0};
+    u16 port = 0;
+
     const char *end;
     size_t delim_pos = 0;
 
     int ret = 0;
-    while (delim_pos < len && addr[delim_pos] != ':')
+    while (delim_pos < len && addr_str[delim_pos] != ':')
     {
         delim_pos++;
     }
 
     if (delim_pos >= len - 1)
     {
-        error("Invalid address: \"%s\"\n", addr);
+        error("Invalid address: \"%s\"\n", addr_str);
         ret = -EINVAL;
         goto out;
     }
 
-    if (!in4_pton(addr, delim_pos, host_ctrl->target_addr, -1, &end))
+    if (!in4_pton(addr_str, delim_pos, addr, -1, &end))
     {
-        error("Error parsing address: \"%s\", last char: %c\n", addr, *end);
+        error("Error parsing address: \"%s\", last char: %c\n", addr_str, *end);
         ret = -EINVAL;
         goto out;
     }
 
-    ret = kstrtou16(addr + delim_pos + 1, 10, &host_ctrl->target_port);
+    ret = kstrtou16(addr_str + delim_pos + 1, 10, &port);
     if (ret)
     {
-        error("Invalid port: \"%s\"\n", addr + delim_pos + 1);
+        error("Invalid port: \"%s\"\n", addr_str + delim_pos + 1);
         goto out;
     }
 
     sin->sin_family = AF_INET;
-    memcpy((void *)&sin->sin_addr.s_addr, &host_ctrl->target_addr, 4);
-    sin->sin_port = host_ctrl->target_port;
+    memcpy((void *)&sin->sin_addr.s_addr, addr, 4);
+    sin->sin_port = port;
 
-    host_ctrl->target_str = kmalloc(len + 1, GFP_KERNEL);
-    if (host_ctrl->target_str == NULL)
-    {
-        error("Failed to allocate memory for target_str\n");
-        ret = -ENOMEM;
-        goto out;
-    }
-    memcpy(host_ctrl->target_str, addr, len);
-    host_ctrl->target_str[len] = '\0';
+    memcpy(host_ctrl->target_addr, addr_str, len);
+    host_ctrl->target_addr[len] = '\0';
 
 out:
     return ret;
@@ -429,7 +441,6 @@ static void cjl_rdma_disconnect(void)
     rdma_disconnect(host_ctrl->cm_id);
     cjl_rdma_free_buffers(host_ctrl);
     cjl_rdma_destroy_queues(host_ctrl);
-    kfree(host_ctrl->target_str);
     host_ctrl->state = INITIATED;
 }
 
@@ -447,21 +458,18 @@ static int cjl_rdma_connect(const char *addr, size_t len)
     ret = rdma_resolve_addr(host_ctrl->cm_id, NULL, (struct sockaddr *)&sin, RDMA_TIMEOUT);
     if (ret)
     {
-        error("Failed to resolve target address: \"%s\"\n", host_ctrl->target_str);
+        error("Failed to resolve target address: \"%s\"\n", addr);
         goto out;
     }
 
     ret = wait_event_interruptible(host_ctrl->sem, host_ctrl->state >= CONNECTED);
     if (ret || host_ctrl->state == ERROR)
     {
-        error("Failed to connect to target: \"%s\"\n", host_ctrl->target_str);
+        error("Failed to connect to target: \"%s\"\n", addr);
         goto out;
     }
 
     info("Connected to target: %s\n", addr);
-
-    // FIXME: remove this after debugging.
-    // cjl_rdma_disconnect();
 
 out:
     return ret;
@@ -489,7 +497,7 @@ static int execute_cmd(const char *cmd, size_t len)
     {
     case 'c':
         ret = cjl_skip_spaces(cmd + pos, len - pos, &pos);
-        if (ret)
+        if (ret || (len - pos) >= MAX_ADDR_STR_LEN)
         {
             error("Invalid address argument \"%s\" for command \"connect\"\n", cmd + pos);
             break;
@@ -539,7 +547,7 @@ static ssize_t proc_entry_read(struct file *__unused, char __user *buff, size_t 
 
     if (host_ctrl->state == CONNECTED)
     {
-        count += sprintf(msg, "Connected to target: %s\n", host_ctrl->target_str);
+        count += sprintf(msg, "Connected to target: %s\n", host_ctrl->target_addr);
     }
     else
     {
