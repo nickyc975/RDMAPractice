@@ -18,6 +18,9 @@
 #define CJL_RDMA_BUFF_SIZE 4096
 #define CJL_RDMA_MAX_NUM_SG (((CJL_RDMA_BUFF_SIZE - 1) & PAGE_MASK) + PAGE_SIZE) >> PAGE_SHIFT
 
+#define htonll cpu_to_be64
+#define ntohll be64_to_cpu
+
 MODULE_AUTHOR("Chen Jinlong");
 MODULE_DESCRIPTION("RDMA practice project target module.");
 MODULE_LICENSE("GPL v2");
@@ -32,9 +35,9 @@ enum cjl_rdma_state
 
 struct cjl_rdma_info
 {
-    uint64_t buff;
-    uint32_t rkey;
+    uint64_t addr;
     uint32_t size;
+    uint32_t rkey;
 };
 
 struct cjl_rdma_ctrl
@@ -141,7 +144,8 @@ out:
     return ret;
 }
 
-static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl) {
+static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl)
+{
     rdma_destroy_qp(ctrl->conn_cm_id);
     ib_destroy_cq(ctrl->cq);
     ib_dealloc_pd(ctrl->pd);
@@ -149,7 +153,19 @@ static void cjl_rdma_destroy_queues(struct cjl_rdma_ctrl *ctrl) {
 
 static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
+    struct cjl_rdma_ctrl *ctrl = cq->cq_context;
     info("RECV done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+
+    if (wc->status == IB_WC_SUCCESS)
+    {
+        info("Received buff: %llu, rkey: %u, size: %u\n",
+             ntohll(ctrl->recv_buff.addr), ntohl(ctrl->recv_buff.rkey), ntohl(ctrl->recv_buff.size));
+    }
+}
+
+static void cjl_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+    info("SEND done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
 }
 
 static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
@@ -167,6 +183,8 @@ static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
     ctrl->send_sge.addr = ctrl->send_dma_addr;
     ctrl->send_sge.length = sizeof(ctrl->send_buff);
     ctrl->send_sge.lkey = ctrl->pd->local_dma_lkey;
+    ctrl->send_cqe.done = cjl_rdma_send_done;
+    ctrl->send_wr.wr_cqe = &ctrl->send_cqe;
     ctrl->send_wr.opcode = IB_WR_SEND;
     ctrl->send_wr.send_flags = IB_SEND_SIGNALED;
     ctrl->send_wr.sg_list = &ctrl->send_sge;
@@ -216,6 +234,7 @@ unmap:
 
 static void cjl_rdma_free_buffers(struct cjl_rdma_ctrl *ctrl)
 {
+    ib_dereg_mr(ctrl->rdma_mr);
     ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
                          ctrl->rdma_buff, ctrl->rdma_dma_addr);
     ib_dma_unmap_single(ctrl->pd->device, ctrl->recv_dma_addr,
@@ -224,8 +243,11 @@ static void cjl_rdma_free_buffers(struct cjl_rdma_ctrl *ctrl)
                         sizeof(ctrl->send_buff), DMA_BIDIRECTIONAL);
 }
 
-static int cjl_rdma_connect_request(struct cjl_rdma_ctrl *ctrl, struct rdma_cm_event *event) {
+static int cjl_rdma_connect_request(struct cjl_rdma_ctrl *ctrl, struct rdma_cm_event *event)
+{
     int ret = 0;
+    const struct ib_recv_wr *bad_wr;
+
     ctrl->state = CONNECT_REQUEST;
 
     ret = cjl_rdma_create_queues(ctrl);
@@ -240,6 +262,14 @@ static int cjl_rdma_connect_request(struct cjl_rdma_ctrl *ctrl, struct rdma_cm_e
     if (ret)
     {
         error("Failed to setup buffers\n");
+        ctrl->state = ERROR;
+        goto out;
+    }
+
+    ret = ib_post_recv(ctrl->qp, &ctrl->recv_wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post recv wr\n");
         ctrl->state = ERROR;
         goto out;
     }
@@ -259,13 +289,17 @@ out:
 static int cjl_rdma_connected(struct cjl_rdma_ctrl *ctrl)
 {
     int ret = 0;
-    const struct ib_recv_wr *bad_wr;
+    const struct ib_send_wr *bad_wr;
 
     ctrl->state = CONNECTED;
-    ret = ib_post_recv(ctrl->qp, &ctrl->recv_wr, &bad_wr);
+
+    ctrl->send_buff.addr = htonll(1234);
+    ctrl->send_buff.rkey = htonl(5678);
+    ctrl->send_buff.size = htonl(91011);
+    ret = ib_post_send(ctrl->qp, &ctrl->send_wr, &bad_wr);
     if (ret)
     {
-        error("Failed to post recv wr\n");
+        error("Failed to post send wr\n");
         goto out;
     }
 
@@ -399,15 +433,16 @@ static int cjl_rdma_accept(const char *addr, size_t len)
     }
 
     ret = wait_event_interruptible(target_ctrl->sem, target_ctrl->state >= CONNECTED);
-	if (ret || target_ctrl->state == ERROR) {
-		error("Failed to accept at: \"%s\"\n", target_ctrl->addr_str);
-		goto out;
-	}
+    if (ret || target_ctrl->state == ERROR)
+    {
+        error("Failed to accept at: \"%s\"\n", target_ctrl->addr_str);
+        goto out;
+    }
 
     info("Host connected\n");
 
     // FIXME: remove this after debugging.
-    cjl_rdma_disconnect();
+    // cjl_rdma_disconnect();
 
 out:
     return ret;
