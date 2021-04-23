@@ -33,6 +33,8 @@ enum cjl_rdma_state
     ADDR_RESOLVED,
     ROUTE_RESOLVED,
     CONNECTED,
+    READ_COMPLETE,
+    WRITE_COMPLETE,
     ERROR,
 };
 
@@ -166,12 +168,40 @@ static void cjl_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
     {
         info("Received buff: %llu, rkey: %u, size: %u\n",
              ntohll(ctrl->recv_buff.addr), ntohl(ctrl->recv_buff.rkey), ntohl(ctrl->recv_buff.size));
+        
+        ctrl->rdma_wr.remote_addr = ntohll(ctrl->recv_buff.addr);
+        ctrl->rdma_wr.rkey = ntohl(ctrl->recv_buff.rkey);
+        ctrl->rdma_wr.wr.sg_list->length = ntohl(ctrl->recv_buff.size);
+        ctrl->rdma_wr.wr.sg_list->lkey = ctrl->rdma_mr->rkey;
     }
 }
 
 static void cjl_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
 {
     info("SEND done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+}
+
+static void cjl_rdma_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+    struct cjl_rdma_ctrl *ctrl = cq->cq_context;
+
+    switch (wc->opcode)
+    {
+    case IB_WC_RDMA_READ:
+        info("READ done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+        ctrl->state = READ_COMPLETE;
+        break;
+    case IB_WC_RDMA_WRITE:
+        info("WRITE done: %s (%d)\n", ib_wc_status_msg(wc->status), wc->status);
+        ctrl->state = WRITE_COMPLETE;
+        break;
+    default:
+        error("Unknown RDMA opcode: %d\n", wc->opcode);
+        ctrl->state = ERROR;
+        break;
+    }
+
+    wake_up_interruptible(&ctrl->sem);
 }
 
 static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
@@ -206,6 +236,14 @@ static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
     ctrl->reg_mr_wr.mr = ctrl->rdma_mr;
     ctrl->reg_mr_wr.key = ctrl->rdma_mr->rkey;
     ctrl->reg_mr_wr.access = IB_ACCESS_REMOTE_READ | IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE;
+
+    // Setup RDMA wr.
+    ctrl->rdma_sge.addr = ctrl->rdma_dma_addr;
+    ctrl->rdma_cqe.done = cjl_rdma_rdma_done;
+    ctrl->rdma_wr.wr.wr_cqe = &ctrl->rdma_cqe;
+    ctrl->rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+    ctrl->rdma_wr.wr.sg_list = &ctrl->rdma_sge;
+    ctrl->rdma_wr.wr.num_sge = 1;
 }
 
 static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
@@ -503,6 +541,63 @@ out:
     return ret;
 }
 
+static int cjl_rdma_read(struct cjl_rdma_ctrl *ctrl)
+{
+    int ret = 0;
+    const struct ib_send_wr *bad_wr;
+
+    ctrl->rdma_wr.wr.opcode = IB_WR_RDMA_READ;
+    ret = ib_post_send(ctrl->qp, &ctrl->rdma_wr.wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post rdma read\n");
+        goto out;
+    }
+
+    ret = wait_event_interruptible(ctrl->sem, ctrl->state >= READ_COMPLETE);
+    if (ret || ctrl->state == ERROR)
+    {
+        error("Failed to read from target\n");
+        goto out;
+    }
+
+    info("READ from target: %s\n", ctrl->rdma_buff);
+
+out:
+    ctrl->state = CONNECTED;
+    return ret;
+}
+
+static int cjl_rdma_write(struct cjl_rdma_ctrl *ctrl, const char *data, size_t len)
+{
+    int ret = 0;
+    const struct ib_send_wr *bad_wr;
+
+    memcpy(ctrl->rdma_buff, data, len);
+    ctrl->rdma_buff[len] = '\0';
+
+    ctrl->rdma_wr.wr.opcode = IB_WR_RDMA_WRITE;
+    ret = ib_post_send(ctrl->qp, &ctrl->rdma_wr.wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post rdma write\n");
+        goto out;
+    }
+
+    ret = wait_event_interruptible(ctrl->sem, ctrl->state >= WRITE_COMPLETE);
+    if (ret || ctrl->state == ERROR)
+    {
+        error("Failed to write to target\n");
+        goto out;
+    }
+
+    info("WRITE to target: %s\n", data);
+
+out:
+    ctrl->state = CONNECTED;
+    return ret;
+}
+
 static inline int cjl_skip_spaces(const char *str, size_t len, size_t *ppos)
 {
     size_t pos = 0;
@@ -533,8 +628,19 @@ static int execute_cmd(const char *cmd, size_t len)
         ret = cjl_rdma_connect(cmd + pos, len - pos);
         break;
     case 'r':
+        ret = cjl_rdma_read(host_ctrl);
         break;
-    case 'W':
+    case 'w':
+        ret = cjl_skip_spaces(cmd + pos, len - pos, &pos);
+        if (ret || (len - pos) >= CJL_RDMA_BUFF_SIZE)
+        {
+            error("Invalid data argument \"%s\" for command \"write\"\n", cmd + pos);
+            break;
+        }
+        ret = cjl_rdma_write(host_ctrl, cmd + pos, len - pos);
+        break;
+    case 's':
+        info("RDMA buffer content: %s\n", host_ctrl->rdma_buff);
         break;
     case 'd':
         if (host_ctrl->state == CONNECTED)
