@@ -68,6 +68,8 @@ struct cjl_rdma_ctrl
     struct cjl_rdma_info send_buff __aligned(16);
     u64 send_dma_addr;
 
+    struct ib_reg_wr reg_mr_wr;
+
     struct ib_rdma_wr rdma_wr;
     struct ib_sge rdma_sge;
     struct ib_cqe rdma_cqe;
@@ -184,6 +186,11 @@ static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
     ctrl->recv_wr.sg_list = &ctrl->recv_sge;
     ctrl->recv_wr.num_sge = 1;
 
+    // Setup send wr buff.
+    ctrl->send_buff.addr = htonll(ctrl->rdma_dma_addr);
+    ctrl->send_buff.rkey = htonl(ctrl->rdma_mr->rkey);
+    ctrl->send_buff.size = htonl(CJL_RDMA_BUFF_SIZE);
+
     // Setup send wr.
     ctrl->send_sge.addr = ctrl->send_dma_addr;
     ctrl->send_sge.length = sizeof(ctrl->send_buff);
@@ -194,11 +201,18 @@ static void cjl_rdma_setup_wrs(struct cjl_rdma_ctrl *ctrl)
     ctrl->send_wr.send_flags = IB_SEND_SIGNALED;
     ctrl->send_wr.sg_list = &ctrl->send_sge;
     ctrl->send_wr.num_sge = 1;
+
+    // Setup register mr wr.
+    ctrl->reg_mr_wr.wr.opcode = IB_WR_REG_MR;
+    ctrl->reg_mr_wr.mr = ctrl->rdma_mr;
+    ctrl->reg_mr_wr.key = ctrl->rdma_mr->rkey;
+    ctrl->reg_mr_wr.access = IB_ACCESS_REMOTE_READ | IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE;
 }
 
 static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
 {
     int ret = 0;
+    struct scatterlist sg = {0};
 
     ctrl->recv_dma_addr = ib_dma_map_single(ctrl->pd->device,
                                             &ctrl->recv_buff, sizeof(ctrl->recv_buff), DMA_BIDIRECTIONAL);
@@ -219,6 +233,16 @@ static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
     {
         error("Failed to register memory region\n");
         ret = PTR_ERR_OR_ZERO(ctrl->rdma_mr);
+        goto free_rdma_buff;
+    }
+
+    // Register buffer in Memory Region.
+    sg_dma_address(&sg) = ctrl->rdma_dma_addr;
+    sg_dma_len(&sg) = CJL_RDMA_BUFF_SIZE;
+    ret = ib_map_mr_sg(ctrl->rdma_mr, &sg, 1, NULL, PAGE_SIZE);
+    if (ret < 0 || ret > CJL_RDMA_MAX_NUM_SG)
+    {
+        error("ib_map_mr_sg returned invalid value: %d, should be 0~%lu\n", ret, CJL_RDMA_MAX_NUM_SG);
         goto free_rdma_buff;
     }
 
@@ -307,13 +331,17 @@ static int cjl_rdma_connected(struct cjl_rdma_ctrl *ctrl)
 
     ctrl->state = CONNECTED;
 
-    ctrl->send_buff.addr = htonll(1234);
-    ctrl->send_buff.rkey = htonl(5678);
-    ctrl->send_buff.size = htonl(91011);
+    ret = ib_post_send(ctrl->qp, &ctrl->reg_mr_wr.wr, &bad_wr);
+    if (ret)
+    {
+        error("Failed to post send reg_mr_wr\n");
+        goto out;
+    }
+
     ret = ib_post_send(ctrl->qp, &ctrl->send_wr, &bad_wr);
     if (ret)
     {
-        error("Failed to post send wr\n");
+        error("Failed to post send send_wr\n");
         goto out;
     }
 
