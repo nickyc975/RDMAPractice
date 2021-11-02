@@ -1,9 +1,11 @@
 # Generated files
+.*
 *.o
 *.ko
 *.o.cmd
 *.ko.cmd
 *.o.d
+*.mod
 *.mod.c
 Module.symvers
 modules.order

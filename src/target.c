@@ -257,7 +257,7 @@ static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
     ctrl->send_dma_addr = ib_dma_map_single(ctrl->pd->device,
                                             &ctrl->send_buff, sizeof(ctrl->send_buff), DMA_BIDIRECTIONAL);
 
-    ctrl->rdma_buff = ib_dma_alloc_coherent(ctrl->pd->device,
+    ctrl->rdma_buff = dma_alloc_coherent(ctrl->pd->device->dma_device,
                                             CJL_RDMA_BUFF_SIZE, &ctrl->rdma_dma_addr, GFP_KERNEL);
     if (ctrl->rdma_buff == NULL)
     {
@@ -289,7 +289,7 @@ static int cjl_rdma_alloc_buffers(struct cjl_rdma_ctrl *ctrl)
     return 0;
 
 free_rdma_buff:
-    ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
+    dma_free_coherent(ctrl->pd->device->dma_device, CJL_RDMA_BUFF_SIZE,
                          ctrl->rdma_buff, ctrl->rdma_dma_addr);
     ctrl->rdma_buff = NULL;
 unmap:
@@ -304,7 +304,7 @@ static void cjl_rdma_free_buffers(struct cjl_rdma_ctrl *ctrl)
 {
     ib_dereg_mr(ctrl->rdma_mr);
     ctrl->rdma_mr = NULL;
-    ib_dma_free_coherent(ctrl->pd->device, CJL_RDMA_BUFF_SIZE,
+    dma_free_coherent(ctrl->pd->device->dma_device, CJL_RDMA_BUFF_SIZE,
                          ctrl->rdma_buff, ctrl->rdma_dma_addr);
     ctrl->rdma_buff = NULL;
     ib_dma_unmap_single(ctrl->pd->device, ctrl->recv_dma_addr,
@@ -727,10 +727,9 @@ out:
     return ret ? ret : len;
 }
 
-static struct file_operations proc_entry_fops = {
-    .owner = THIS_MODULE,
-    .read = proc_entry_read,
-    .write = proc_entry_write,
+static struct proc_ops proc_entry_fops = {
+    .proc_read = proc_entry_read,
+    .proc_write = proc_entry_write,
 };
 
 static int __init target_init(void)
